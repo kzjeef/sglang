@@ -28,6 +28,7 @@ class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
+    AITER = "aiter"
 
     @classmethod
     def resolve(cls, model_runner: ModelRunner) -> DSATopKBackend:
@@ -49,6 +50,9 @@ class DSATopKBackend(Enum):
     def is_flashinfer(self) -> bool:
         return self == DSATopKBackend.FLASHINFER
 
+    def is_aiter(self) -> bool:
+        return self == DSATopKBackend.AITER
+
     def should_use_topk_v2(self) -> bool:
         return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
 
@@ -59,7 +63,10 @@ class DSATopKBackend(Enum):
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.is_sgl_kernel():
+        # The aiter backend replaces only the fused PAGED transform below; the
+        # unfused selection has no aiter equivalent worth a separate path, so it
+        # shares the sgl-kernel one.
+        if self.is_sgl_kernel() or self.is_aiter():
             from sgl_kernel import fast_topk_v2
 
             return fast_topk_v2(score, lengths, topk, row_starts=row_starts)
@@ -153,7 +160,74 @@ class DSATopKBackend(Enum):
         # dispatched to v2 above.
         assert attn_metadata.page_table_1 is not None
 
-        if self.is_sgl_kernel():
+        # The aiter backend fuses selection and the page-table gather into one
+        # kernel (aiter.dsa_topk_transform), which on MI355X measured 1.82-2.22x
+        # fast_topk_transform_fused across batch 1-256 on GLM-5.2 decode logits,
+        # with identical output. Everything outside the gate, RAGGED included,
+        # falls through to the sgl-kernel transforms below.
+        #
+        # The op indexes the page table per logit row, so what it needs is the
+        # row -> page-table-row map. Two shapes provide one:
+        #
+        #   decode, and spec verify / draft extend, which sglang has already
+        #     expanded to one page-table row per logit row (repeat_interleave on
+        #     the eager path, [:bs * draft, :] under CUDA graph). The map is the
+        #     identity, so nothing is passed. This is also what lets the path
+        #     ignore cu_seqlens_q_topk, which is never None here but is
+        #     necessarily all-ones once the row counts match.
+        #   PAGED prefill, a chunk of token rows against a table with one row per
+        #     sequence. The map arrives as batch_idx_list, which the sgl-kernel
+        #     path below spends on page_table_1[batch_idx_list] -- at 100k context
+        #     that expands a 400 KB table into ~1 GB, per chunk, per indexer
+        #     layer. Forwarding it as ptRowMap indexes the table instead.
+        #
+        # RAGGED, the CP form of batch_idx_list and any k != 2048 fall through;
+        # the op is instantiated for k=2048 only.
+        _g = (
+            self.is_aiter()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and topk == 2048
+            and (
+                pt_row_map := _aiter_pt_row_map(
+                    logits, lengths, attn_metadata, batch_idx_list
+                )
+            )
+            is not _AITER_ROWS_UNSUPPORTED
+        )
+        import atexit as _atexit, collections as _c, json as _json, os as _os
+
+        _h = globals().get("_TOPK_HIST")
+        if _h is None:
+            _h = globals()["_TOPK_HIST"] = _c.Counter()
+
+            @_atexit.register
+            def _dump(_h=_h):
+                _json.dump(
+                    [
+                        {"branch": k[0], "rows": k[1], "pt": k[2], "calls": v}
+                        for k, v in sorted(_h.items())
+                    ],
+                    open(f"/workspace/ab/hist/topk_{_os.getpid()}.json", "w"),
+                )
+
+        _h[
+            (
+                "aiter" if _g else "sgl",
+                int(logits.shape[0]),
+                int(attn_metadata.page_table_1.shape[0]),
+            )
+        ] += 1
+        if _g:
+            return _topk_transform_aiter_paged(
+                logits,
+                lengths,
+                topk,
+                attn_metadata,
+                row_starts=row_starts,
+                pt_row_map=pt_row_map,
+            )
+
+        if self.is_sgl_kernel() or self.is_aiter():
             from sgl_kernel import (
                 fast_topk_transform_fused,
                 fast_topk_transform_ragged_fused,
@@ -273,6 +347,114 @@ def _topk_unfused(
     return topk_indices
 
 
+_AITER_ROWS_UNSUPPORTED = object()
+
+
+def _aiter_pt_row_map(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    attn_metadata,
+    batch_idx_list,
+):
+    """Row -> ``page_table_1`` row for the aiter op, or ``_AITER_ROWS_UNSUPPORTED``.
+
+    ``None`` is a valid result and means the identity, which the op reads as "no
+    map"; the sentinel is what says the shape cannot be served. They have to be
+    distinguishable, hence not ``None`` for both.
+
+    The CP form of ``batch_idx_list`` is a Python list of per-chunk batch ids
+    rather than a per-token device tensor. Converting it here would add a
+    host->device copy on every call, so it is left to the sgl-kernel path.
+    """
+    num_rows = logits.shape[0]
+    page_table = attn_metadata.page_table_1
+    if page_table is None or lengths.shape[0] != num_rows:
+        return _AITER_ROWS_UNSUPPORTED
+    if batch_idx_list is None:
+        return None if num_rows == page_table.shape[0] else _AITER_ROWS_UNSUPPORTED
+    if (
+        not isinstance(batch_idx_list, torch.Tensor)
+        or batch_idx_list.shape[0] != num_rows
+    ):
+        return _AITER_ROWS_UNSUPPORTED
+    return batch_idx_list
+
+
+def _topk_transform_aiter_paged(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    attn_metadata,
+    row_starts: Optional[torch.Tensor] = None,
+    pt_row_map: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused top-k + page-table transform via aiter's ``dsa_topk_transform``.
+
+    Returns the transformed page indices ``(num_rows, topk)`` int32 -- physical
+    page_size=1 KV slots, ``-1`` padded, identical in meaning to what
+    ``fast_topk_transform_fused`` returns for the same inputs.
+
+    One kernel does both halves: a cooperative radix-select picks the top-k of
+    ``logits[row, start:start + lengths[row]]``, then a tail pass maps each winner
+    through ``page_table_1`` before the indices are ever written back. That removes
+    both the second launch and the ``(num_rows, topk)`` round trip that sglang's
+    post-top-k op chain pays (see ``_topk_transform_512_vectorized``).
+
+    This consumes the page_size=1 table rather than the compact ``real_page_table``
+    that ``_topk_transform_v2_paged`` uses. The op itself handles any power-of-two
+    page size, but on HIP the indexer still reads ``page_table_1``, so the wide
+    table exists regardless (see ``dsa_drop_wide_page_table``, which excludes HIP)
+    and there is nothing to save by bypassing it yet.
+
+    Positions are row-local before the lookup, which is what a per-row gather into
+    ``page_table_1`` expects, so ``row_starts`` shifts only where the row is *read*
+    and needs no correction on the way out.
+
+    ``pt_row_map`` gives each logits row its page-table row, for prefill, where a
+    chunk of token rows shares one table row per sequence. ``None`` is the
+    identity. Passing the map rather than gathering ``page_table[map]`` here is
+    the point: at 100k context that gather expands a 400 KB table into ~1 GB.
+    """
+    import aiter
+
+    num_rows = logits.shape[0]
+
+    # Same ABI the v2 CUDA path asserts: the indexer emits fp32 with unit row
+    # stride, possibly as a padded view (stride(0) > width, so not contiguous).
+    # Assert the real requirement instead of forcing a copy of the wide buffer.
+    assert (
+        logits.dtype == torch.float32 and logits.stride(1) == 1
+    ), f"aiter top-k expects fp32 scores with unit row stride, got {logits.dtype=} {logits.stride()=}"
+
+    page_table = attn_metadata.page_table_1
+    assert page_table.dtype == torch.int32
+
+    lengths_i32 = lengths.to(dtype=torch.int32)
+    if row_starts is None:
+        # The kernel reads a null rowStarts as "every row starts at 0", which is
+        # what decode wants and what saves a per-call zeros tensor.
+        row_ends = lengths_i32
+    else:
+        row_starts = row_starts.to(dtype=torch.int32)
+        row_ends = row_starts + lengths_i32
+
+    if pt_row_map is not None:
+        pt_row_map = pt_row_map.to(dtype=torch.int32)
+
+    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
+    aiter.dsa_topk_transform(
+        logits,
+        row_starts,
+        row_ends,
+        page_table,
+        out,
+        1,
+        topk,
+        ptRowMap=pt_row_map,
+    )
+    return out
+
+
 def _topk_transform_v2_paged(
     logits: torch.Tensor,
     lengths: torch.Tensor,
@@ -323,6 +505,8 @@ def _topk_transform_v2_paged(
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
     page_table = attn_metadata.real_page_table
+    assert page_table.dtype == torch.int32
+    lengths_i32 = lengths.to(torch.int32)
 
     # The plan is preprocessed once per forward (DSAMetadata.topk_v2_plan,
     # refreshed in-place under CUDA graph) and reused across layers. A missing or
@@ -334,8 +518,8 @@ def _topk_transform_v2_paged(
     ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
 
     page_size = attn_metadata.page_size
-    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
-    topk_transform_512_v2(logits, lengths, page_table, out, page_size, plan)
+    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
+    topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
     return out
 
 
